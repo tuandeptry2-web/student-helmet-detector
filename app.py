@@ -6,52 +6,73 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from PIL import Image
 import cloudinary
 import cloudinary.uploader
 import cv2
 import numpy as np
+import traceback
 
-# Load env (in Render use environment variables instead of .env file)
+# Load local .env if present (in Render prefer env vars)
 load_dotenv(".env")
 
+# Cloudinary config from env
 CLOUD_NAME = os.getenv("CLOUD_NAME")
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
+if CLOUD_NAME and API_KEY and API_SECRET:
+    cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET, secure=True)
 
-cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET, secure=True)
-
-# Models (paths should be in repo or downloaded at startup)
+# Models (ensure models are available in repo or downloaded at startup)
 DETECT_MODEL_PATH = os.getenv("DETECT_MODEL_PATH", "best_No_Helmet_Detection.pt")
 PLATE_MODEL_PATH = os.getenv("PLATE_MODEL_PATH", "best_License_Plate_Recognition.pt")
 
+# Config thresholds
 DETECT_CONF = float(os.getenv("DETECT_CONF", 0.25))
 CHAR_CONF = float(os.getenv("CHAR_CONF", 0.3))
 
+# Load YOLO models (this may take time)
+print("Loading detect model:", DETECT_MODEL_PATH)
 detect_model = YOLO(DETECT_MODEL_PATH)
+print("Loading plate-char model:", PLATE_MODEL_PATH)
 plate_char_model = YOLO(PLATE_MODEL_PATH)
+print("Models loaded.")
 
 app = FastAPI(title="Helmet Violation API")
 
+# CORS setup
+# Set CORS_ORIGINS env var to a comma-separated list like:
+# "https://student-helmet-detector.netlify.app, https://your-other-domain.com"
+cors_origins_env = os.getenv("CORS_ORIGINS", "*")
+if cors_origins_env.strip() == "*" or cors_origins_env.strip() == "":
+    origins = ["*"]
+else:
+    origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Utility functions
 def read_image_from_bytes(data: bytes) -> Image.Image:
-    """Read bytes into PIL RGB image."""
     try:
         pil = Image.open(io.BytesIO(data)).convert("RGB")
         return pil
     except Exception:
-        # try with cv2 fallback
         arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            raise
+            raise RuntimeError("Cannot decode image bytes")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return Image.fromarray(img)
 
-
 def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
-    """Save bytes to temp file and extract a middle frame using cv2."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
         tmp.write(data)
         tmp.flush()
@@ -59,11 +80,7 @@ def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
         if not vid.isOpened():
             raise RuntimeError("Cannot open video")
         length = int(vid.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if length <= 0:
-            # fallback to first frame
-            frame_no = 0
-        else:
-            frame_no = max(0, length // 2)
+        frame_no = 0 if length <= 0 else max(0, length // 2)
         vid.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
         ret, frame = vid.read()
         vid.release()
@@ -72,11 +89,8 @@ def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return Image.fromarray(frame)
 
-
 def ocr_plate_from_pil(pil_crop: Image.Image) -> str:
-    """Basic OCR using your plate-char YOLO model. Returns normalized string (best-effort)."""
     try:
-        # convert to array BGR for model.predict compatibility
         arr = cv2.cvtColor(np.array(pil_crop), cv2.COLOR_RGB2BGR)
         results = plate_char_model.predict(source=arr, conf=CHAR_CONF, verbose=False)
         chars = []
@@ -90,51 +104,59 @@ def ocr_plate_from_pil(pil_crop: Image.Image) -> str:
             return ""
         chars_sorted = sorted(chars, key=lambda c: c['x'])
         text = "".join([c['char'] for c in chars_sorted])
-        # light normalization: uppercase and remove non-alnum
         text = ''.join([c for c in text.upper() if c.isalnum()])
         return text
     except Exception:
         return ""
 
+@app.get("/")
+def root():
+    return {"status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     """
-    Accept image or video file.
-    For images: process directly.
-    For videos: extract a middle frame for analysis.
-    Returns JSON: {"violations": [{"time":..., "plate":..., "image_url":...}, ...]}
+    Accept image or video file (form-data 'file').
+    Returns a JSON array of violations:
+    [
+      {
+        "time": "...",
+        "license_plate": "...",
+        "cropped_image_url": "...",
+        "violation_type": "no_helmet_front"
+      },
+      ...
+    ]
     """
-    content = await file.read()
-    kind = (file.content_type or "").lower()
-
     try:
+        content = await file.read()
+        kind = (file.content_type or "").lower()
+
         if kind.startswith("video"):
             pil_img = extract_frame_from_video_bytes(content)
         else:
             pil_img = read_image_from_bytes(content)
     except Exception as e:
+        tb = traceback.format_exc()
+        print("Read file error:", e, tb)
         return JSONResponse(status_code=400, content={"error": f"Cannot read file: {str(e)}"})
 
     # run detection
     try:
         results = detect_model(pil_img, conf=DETECT_CONF)
     except Exception as e:
+        tb = traceback.format_exc()
+        print("Detection error:", e, tb)
         return JSONResponse(status_code=500, content={"error": f"Detection failed: {str(e)}"})
 
     violations = []
-    # For each result (frame / image)
     for res in results:
-        # collect plate boxes separately to associate later
         plate_boxes = [b for b in res.boxes if detect_model.names[int(b.cls)] == "license_plate"]
-        # iterate boxes to find violation types
         for b in res.boxes:
             cls_name = detect_model.names[int(b.cls)]
             if cls_name in ("no_helmet_front", "no_helmet_back", "wrong_helmet_front", "wrong_helmet_back"):
-                # crop violation region from pil_img
                 xy = b.xyxy[0].cpu().numpy().astype(int).tolist()
                 x1, y1, x2, y2 = xy
-                # clamp safe
                 w, h = pil_img.size
                 x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
                 y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
@@ -142,13 +164,12 @@ async def analyze(file: UploadFile = File(...)):
                     continue
                 viol_crop = pil_img.crop((x1, y1, x2, y2))
 
-                # try find nearest plate (simple nearest by center)
+                # find nearest plate
                 plate_text = ""
                 if plate_boxes:
-                    # choose plate with minimal squared distance of centers
                     def center(box):
-                        a, b, c, d = box.xyxy[0].cpu().numpy()
-                        return ((a + c) / 2.0, (b + d) / 2.0)
+                        a, b2, c, d = box.xyxy[0].cpu().numpy()
+                        return ((a + c) / 2.0, (b2 + d) / 2.0)
                     tx = (x1 + x2) / 2.0; ty = (y1 + y2) / 2.0
                     best = None; best_d = None
                     for pb in plate_boxes:
@@ -165,22 +186,29 @@ async def analyze(file: UploadFile = File(...)):
                             plate_crop = pil_img.crop((px1, py1, px2, py2))
                             plate_text = ocr_plate_from_pil(plate_crop)
 
-                # upload violation crop to Cloudinary
-                buf = io.BytesIO()
-                viol_crop.save(buf, format="JPEG")
-                buf.seek(0)
+                # upload to cloudinary (if configured)
+                cropped_url = ""
                 try:
-                    upl = cloudinary.uploader.upload(buf, folder="violations")
-                    url = upl.get("secure_url", "")
-                except Exception:
-                    url = ""
+                    buf = io.BytesIO()
+                    viol_crop.save(buf, format="JPEG")
+                    buf.seek(0)
+                    if CLOUD_NAME and API_KEY and API_SECRET:
+                        upl = cloudinary.uploader.upload(buf, folder="violations")
+                        cropped_url = upl.get("secure_url", "")
+                    else:
+                        # If Cloudinary not set, we could optionally save locally and serve static files.
+                        cropped_url = ""
+                except Exception as e:
+                    print("Cloudinary upload error:", e)
+                    cropped_url = ""
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 violations.append({
                     "time": ts,
-                    "plate": plate_text,
-                    "image_url": url,
+                    "license_plate": plate_text,
+                    "cropped_image_url": cropped_url,
                     "violation_type": cls_name
                 })
 
-    return JSONResponse(content={"violations": violations})
+    # Return list (frontend expects array)
+    return JSONResponse(content=violations)
