@@ -4,3 +4,4 @@ ultralytics
 pillow
 cloudinary
 python-dotenv
+python-multipart
