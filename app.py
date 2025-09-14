@@ -1,4 +1,7 @@
-import os, io, csv
+# app.py
+import os
+import io
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
@@ -7,82 +10,177 @@ from ultralytics import YOLO
 from PIL import Image
 import cloudinary
 import cloudinary.uploader
+import cv2
+import numpy as np
 
-# Load biến môi trường (Cloudinary)
+# Load env (in Render use environment variables instead of .env file)
 load_dotenv(".env")
-cloudinary.config(
-    cloud_name=os.getenv("CLOUD_NAME"),
-    api_key=os.getenv("API_KEY"),
-    api_secret=os.getenv("API_SECRET"),
-    secure=True
-)
 
-# Load models
-detect_model = YOLO("best_No_Helmet_Detection.pt")           # model phát hiện vi phạm
-plate_char_model = YOLO("best_License_Plate_Recognition.pt") # model OCR biển số
+CLOUD_NAME = os.getenv("CLOUD_NAME")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
-app = FastAPI()
+cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET, secure=True)
 
-# OCR biển số đơn giản (dựa theo model ký tự của bạn)
-def ocr_plate(pil_crop):
+# Models (paths should be in repo or downloaded at startup)
+DETECT_MODEL_PATH = os.getenv("DETECT_MODEL_PATH", "best_No_Helmet_Detection.pt")
+PLATE_MODEL_PATH = os.getenv("PLATE_MODEL_PATH", "best_License_Plate_Recognition.pt")
+
+DETECT_CONF = float(os.getenv("DETECT_CONF", 0.25))
+CHAR_CONF = float(os.getenv("CHAR_CONF", 0.3))
+
+detect_model = YOLO(DETECT_MODEL_PATH)
+plate_char_model = YOLO(PLATE_MODEL_PATH)
+
+app = FastAPI(title="Helmet Violation API")
+
+
+def read_image_from_bytes(data: bytes) -> Image.Image:
+    """Read bytes into PIL RGB image."""
     try:
-        results = plate_char_model.predict(pil_crop, conf=0.3, verbose=False)
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        return pil
+    except Exception:
+        # try with cv2 fallback
+        arr = np.frombuffer(data, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(img)
+
+
+def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
+    """Save bytes to temp file and extract a middle frame using cv2."""
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        vid = cv2.VideoCapture(tmp.name)
+        if not vid.isOpened():
+            raise RuntimeError("Cannot open video")
+        length = int(vid.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if length <= 0:
+            # fallback to first frame
+            frame_no = 0
+        else:
+            frame_no = max(0, length // 2)
+        vid.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ret, frame = vid.read()
+        vid.release()
+        if not ret or frame is None:
+            raise RuntimeError("Cannot read frame from video")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame)
+
+
+def ocr_plate_from_pil(pil_crop: Image.Image) -> str:
+    """Basic OCR using your plate-char YOLO model. Returns normalized string (best-effort)."""
+    try:
+        # convert to array BGR for model.predict compatibility
+        arr = cv2.cvtColor(np.array(pil_crop), cv2.COLOR_RGB2BGR)
+        results = plate_char_model.predict(source=arr, conf=CHAR_CONF, verbose=False)
         chars = []
         for r in results:
             for b in r.boxes:
-                label = plate_char_model.names[int(b.cls)]
+                cls_idx = int(b.cls)
+                label = plate_char_model.names[cls_idx]
                 x1, y1, x2, y2 = b.xyxy[0].cpu().numpy()
-                chars.append((label, (x1 + x2) / 2))
+                chars.append({'char': label, 'x': float((x1 + x2) / 2.0)})
         if not chars:
             return ""
-        # sắp xếp ký tự theo trục X (trái → phải)
-        chars_sorted = sorted(chars, key=lambda c: c[1])
-        return "".join([c[0] for c in chars_sorted])
-    except:
+        chars_sorted = sorted(chars, key=lambda c: c['x'])
+        text = "".join([c['char'] for c in chars_sorted])
+        # light normalization: uppercase and remove non-alnum
+        text = ''.join([c for c in text.upper() if c.isalnum()])
+        return text
+    except Exception:
         return ""
+
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    # Đọc ảnh upload
-    contents = await file.read()
-    pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+    """
+    Accept image or video file.
+    For images: process directly.
+    For videos: extract a middle frame for analysis.
+    Returns JSON: {"violations": [{"time":..., "plate":..., "image_url":...}, ...]}
+    """
+    content = await file.read()
+    kind = (file.content_type or "").lower()
 
-    # Chạy YOLO detect
-    results = detect_model(pil_img, conf=0.25)
+    try:
+        if kind.startswith("video"):
+            pil_img = extract_frame_from_video_bytes(content)
+        else:
+            pil_img = read_image_from_bytes(content)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Cannot read file: {str(e)}"})
+
+    # run detection
+    try:
+        results = detect_model(pil_img, conf=DETECT_CONF)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Detection failed: {str(e)}"})
 
     violations = []
-
+    # For each result (frame / image)
     for res in results:
+        # collect plate boxes separately to associate later
+        plate_boxes = [b for b in res.boxes if detect_model.names[int(b.cls)] == "license_plate"]
+        # iterate boxes to find violation types
         for b in res.boxes:
-            cls = detect_model.names[int(b.cls)]
-            if cls in ("no_helmet_front","no_helmet_back","wrong_helmet_front","wrong_helmet_back"):
-                # Crop vi phạm
-                box = b.xyxy[0].cpu().numpy().astype(int).tolist()
-                viol_crop = pil_img.crop((box[0], box[1], box[2], box[3]))
+            cls_name = detect_model.names[int(b.cls)]
+            if cls_name in ("no_helmet_front", "no_helmet_back", "wrong_helmet_front", "wrong_helmet_back"):
+                # crop violation region from pil_img
+                xy = b.xyxy[0].cpu().numpy().astype(int).tolist()
+                x1, y1, x2, y2 = xy
+                # clamp safe
+                w, h = pil_img.size
+                x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
+                y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                viol_crop = pil_img.crop((x1, y1, x2, y2))
 
-                # Tìm biển số gần nhất
+                # try find nearest plate (simple nearest by center)
                 plate_text = ""
-                plate_boxes = [p for p in res.boxes if detect_model.names[int(p.cls)] == "license_plate"]
                 if plate_boxes:
-                    pb = plate_boxes[0].xyxy[0].cpu().numpy().astype(int).tolist()
-                    plate_crop = pil_img.crop((pb[0], pb[1], pb[2], pb[3]))
-                    plate_text = ocr_plate(plate_crop)
+                    # choose plate with minimal squared distance of centers
+                    def center(box):
+                        a, b, c, d = box.xyxy[0].cpu().numpy()
+                        return ((a + c) / 2.0, (b + d) / 2.0)
+                    tx = (x1 + x2) / 2.0; ty = (y1 + y2) / 2.0
+                    best = None; best_d = None
+                    for pb in plate_boxes:
+                        cx, cy = center(pb)
+                        d = (cx - tx) ** 2 + (cy - ty) ** 2
+                        if best is None or d < best_d:
+                            best = pb; best_d = d
+                    if best is not None:
+                        pb_xy = best.xyxy[0].cpu().numpy().astype(int).tolist()
+                        px1, py1, px2, py2 = pb_xy
+                        px1 = max(0, min(px1, w - 1)); px2 = max(0, min(px2, w - 1))
+                        py1 = max(0, min(py1, h - 1)); py2 = max(0, min(py2, h - 1))
+                        if px2 > px1 and py2 > py1:
+                            plate_crop = pil_img.crop((px1, py1, px2, py2))
+                            plate_text = ocr_plate_from_pil(plate_crop)
 
-                # Upload Cloudinary
+                # upload violation crop to Cloudinary
                 buf = io.BytesIO()
-                viol_crop.save(buf, "JPEG")
+                viol_crop.save(buf, format="JPEG")
                 buf.seek(0)
-                upl = cloudinary.uploader.upload(buf, folder="violations")
-                url = upl.get("secure_url", "")
+                try:
+                    upl = cloudinary.uploader.upload(buf, folder="violations")
+                    url = upl.get("secure_url", "")
+                except Exception:
+                    url = ""
 
-                # Thời gian
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                # Trả kết quả
                 violations.append({
                     "time": ts,
                     "plate": plate_text,
-                    "image_url": url
+                    "image_url": url,
+                    "violation_type": cls_name
                 })
 
     return JSONResponse(content={"violations": violations})
