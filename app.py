@@ -1,4 +1,3 @@
-# app.py
 import os
 import io
 import tempfile
@@ -15,25 +14,22 @@ import cv2
 import numpy as np
 import traceback
 
-# Load local .env if present (in Render prefer env vars)
+# Load .env (nếu có)
 load_dotenv(".env")
 
-# Cloudinary config from env
+# Cloudinary config
 CLOUD_NAME = os.getenv("CLOUD_NAME")
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 if CLOUD_NAME and API_KEY and API_SECRET:
     cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET, secure=True)
 
-# Models (ensure models are available in repo or downloaded at startup)
+# Model paths
 DETECT_MODEL_PATH = os.getenv("DETECT_MODEL_PATH", "best_No_Helmet_Detection.pt")
 PLATE_MODEL_PATH = os.getenv("PLATE_MODEL_PATH", "best_License_Plate_Recognition.pt")
-
-# Config thresholds
 DETECT_CONF = float(os.getenv("DETECT_CONF", 0.25))
 CHAR_CONF = float(os.getenv("CHAR_CONF", 0.3))
 
-# Load YOLO models (this may take time)
 print("Loading detect model:", DETECT_MODEL_PATH)
 detect_model = YOLO(DETECT_MODEL_PATH)
 print("Loading plate-char model:", PLATE_MODEL_PATH)
@@ -42,14 +38,12 @@ print("Models loaded.")
 
 app = FastAPI(title="Helmet Violation API")
 
-# CORS setup
-# Set CORS_ORIGINS env var to a comma-separated list like:
-# "https://student-helmet-detector.netlify.app, https://your-other-domain.com"
-cors_origins_env = os.getenv("CORS_ORIGINS", "*")
-if cors_origins_env.strip() == "*" or cors_origins_env.strip() == "":
-    origins = ["*"]
-else:
-    origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+# ✅ CORS FIX - hardcode domain của bạn
+origins = [
+    "http://localhost:3000",
+    "https://clever-travesseiro-77cca4.netlify.app",  # Netlify mới
+    "https://student-helmet-detector.netlify.app"     # Netlify cũ (nếu bạn rename lại)
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,7 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Utility functions
 def read_image_from_bytes(data: bytes) -> Image.Image:
     try:
         pil = Image.open(io.BytesIO(data)).convert("RGB")
@@ -115,23 +108,9 @@ def root():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    """
-    Accept image or video file (form-data 'file').
-    Returns a JSON array of violations:
-    [
-      {
-        "time": "...",
-        "license_plate": "...",
-        "cropped_image_url": "...",
-        "violation_type": "no_helmet_front"
-      },
-      ...
-    ]
-    """
     try:
         content = await file.read()
         kind = (file.content_type or "").lower()
-
         if kind.startswith("video"):
             pil_img = extract_frame_from_video_bytes(content)
         else:
@@ -141,7 +120,6 @@ async def analyze(file: UploadFile = File(...)):
         print("Read file error:", e, tb)
         return JSONResponse(status_code=400, content={"error": f"Cannot read file: {str(e)}"})
 
-    # run detection
     try:
         results = detect_model(pil_img, conf=DETECT_CONF)
     except Exception as e:
@@ -164,7 +142,6 @@ async def analyze(file: UploadFile = File(...)):
                     continue
                 viol_crop = pil_img.crop((x1, y1, x2, y2))
 
-                # find nearest plate
                 plate_text = ""
                 if plate_boxes:
                     def center(box):
@@ -186,7 +163,6 @@ async def analyze(file: UploadFile = File(...)):
                             plate_crop = pil_img.crop((px1, py1, px2, py2))
                             plate_text = ocr_plate_from_pil(plate_crop)
 
-                # upload to cloudinary (if configured)
                 cropped_url = ""
                 try:
                     buf = io.BytesIO()
@@ -195,12 +171,8 @@ async def analyze(file: UploadFile = File(...)):
                     if CLOUD_NAME and API_KEY and API_SECRET:
                         upl = cloudinary.uploader.upload(buf, folder="violations")
                         cropped_url = upl.get("secure_url", "")
-                    else:
-                        # If Cloudinary not set, we could optionally save locally and serve static files.
-                        cropped_url = ""
                 except Exception as e:
                     print("Cloudinary upload error:", e)
-                    cropped_url = ""
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 violations.append({
@@ -210,5 +182,4 @@ async def analyze(file: UploadFile = File(...)):
                     "violation_type": cls_name
                 })
 
-    # Return list (frontend expects array)
     return JSONResponse(content=violations)
