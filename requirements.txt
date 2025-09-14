@@ -1,9 +1,8 @@
 fastapi
 uvicorn[standard]
 ultralytics
-opencv-python
 pillow
 cloudinary
-numpy
 python-dotenv
+opencv-python-headless
 python-multipart
