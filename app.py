@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import traceback
 
-# Load .env (nếu có)
+# Load .env
 load_dotenv(".env")
 
 # Cloudinary config
@@ -38,11 +38,10 @@ print("Models loaded.")
 
 app = FastAPI(title="Helmet Violation API")
 
-# ✅ CORS FIX - hardcode domain của bạn
 origins = [
     "http://localhost:3000",
-    "https://clever-travesseiro-77cca4.netlify.app",  # Netlify mới
-    "https://student-helmet-detector.netlify.app"     # Netlify cũ (nếu bạn rename lại)
+    "https://clever-travesseiro-77cca4.netlify.app",
+    "https://student-helmet-detector.netlify.app"
 ]
 
 app.add_middleware(
@@ -129,57 +128,56 @@ async def analyze(file: UploadFile = File(...)):
 
     violations = []
     for res in results:
+        # Lọc box motorcyclist và plate
+        motorcyclists = [b for b in res.boxes if detect_model.names[int(b.cls)] == "motorcyclist"]
         plate_boxes = [b for b in res.boxes if detect_model.names[int(b.cls)] == "license_plate"]
-        for b in res.boxes:
-            cls_name = detect_model.names[int(b.cls)]
-            if cls_name in ("no_helmet_front", "no_helmet_back", "wrong_helmet_front", "wrong_helmet_back"):
-                xy = b.xyxy[0].cpu().numpy().astype(int).tolist()
-                x1, y1, x2, y2 = xy
-                w, h = pil_img.size
-                x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
-                y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                viol_crop = pil_img.crop((x1, y1, x2, y2))
 
-                plate_text = ""
-                if plate_boxes:
-                    def center(box):
-                        a, b2, c, d = box.xyxy[0].cpu().numpy()
-                        return ((a + c) / 2.0, (b2 + d) / 2.0)
-                    tx = (x1 + x2) / 2.0; ty = (y1 + y2) / 2.0
-                    best = None; best_d = None
-                    for pb in plate_boxes:
-                        cx, cy = center(pb)
-                        d = (cx - tx) ** 2 + (cy - ty) ** 2
-                        if best is None or d < best_d:
-                            best = pb; best_d = d
-                    if best is not None:
-                        pb_xy = best.xyxy[0].cpu().numpy().astype(int).tolist()
-                        px1, py1, px2, py2 = pb_xy
-                        px1 = max(0, min(px1, w - 1)); px2 = max(0, min(px2, w - 1))
-                        py1 = max(0, min(py1, h - 1)); py2 = max(0, min(py2, h - 1))
-                        if px2 > px1 and py2 > py1:
-                            plate_crop = pil_img.crop((px1, py1, px2, py2))
-                            plate_text = ocr_plate_from_pil(plate_crop)
+        for mot_box in motorcyclists:
+            # Crop ảnh motorcyclist
+            x1, y1, x2, y2 = mot_box.xyxy[0].cpu().numpy().astype(int).tolist()
+            w, h = pil_img.size
+            x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
+            y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            mot_crop = pil_img.crop((x1, y1, x2, y2))
 
-                cropped_url = ""
-                try:
-                    buf = io.BytesIO()
-                    viol_crop.save(buf, format="JPEG")
-                    buf.seek(0)
-                    if CLOUD_NAME and API_KEY and API_SECRET:
-                        upl = cloudinary.uploader.upload(buf, folder="violations")
-                        cropped_url = upl.get("secure_url", "")
-                except Exception as e:
-                    print("Cloudinary upload error:", e)
+            # Tìm biển số gần motorcyclist nhất
+            plate_text = ""
+            if plate_boxes:
+                mx = (x1 + x2) / 2.0; my = (y1 + y2) / 2.0
+                best = None; best_d = None
+                for pb in plate_boxes:
+                    px1, py1, px2, py2 = pb.xyxy[0].cpu().numpy()
+                    cx, cy = (px1+px2)/2.0, (py1+py2)/2.0
+                    d = (cx - mx) ** 2 + (cy - my) ** 2
+                    if best is None or d < best_d:
+                        best = pb; best_d = d
+                if best is not None:
+                    px1, py1, px2, py2 = best.xyxy[0].cpu().numpy().astype(int).tolist()
+                    px1 = max(0, min(px1, w - 1)); px2 = max(0, min(px2, w - 1))
+                    py1 = max(0, min(py1, h - 1)); py2 = max(0, min(py2, h - 1))
+                    if px2 > px1 and py2 > py1:
+                        plate_crop = pil_img.crop((px1, py1, px2, py2))
+                        plate_text = ocr_plate_from_pil(plate_crop)
 
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                violations.append({
-                    "time": ts,
-                    "license_plate": plate_text,
-                    "cropped_image_url": cropped_url,
-                    "violation_type": cls_name
-                })
+            cropped_url = ""
+            try:
+                buf = io.BytesIO()
+                mot_crop.save(buf, format="JPEG")
+                buf.seek(0)
+                if CLOUD_NAME and API_KEY and API_SECRET:
+                    upl = cloudinary.uploader.upload(buf, folder="violations")
+                    cropped_url = upl.get("secure_url", "")
+            except Exception as e:
+                print("Cloudinary upload error:", e)
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            violations.append({
+                "time": ts,
+                "license_plate": plate_text,
+                "cropped_image_url": cropped_url,
+                "violation_type": "motorcyclist"
+            })
 
     return JSONResponse(content=violations)
