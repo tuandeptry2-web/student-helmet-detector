@@ -1,6 +1,7 @@
 # app.py (fixed, full)
 import os
 import io
+import re
 import math
 import tempfile
 import traceback
@@ -30,23 +31,19 @@ PLATE_MODEL_PATH = os.getenv("PLATE_MODEL_PATH", "best_License_Plate_Recognition
 
 DETECT_CONF = float(os.getenv("DETECT_CONF", 0.25))
 CHAR_CONF = float(os.getenv("CHAR_CONF", 0.3))
-
-# device for YOLO: 'cpu' or 'cuda:0'
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "cpu")
 
-# skip rules (as in your original script)
 SKIP_IF_TRUNCATED = os.getenv("SKIP_IF_TRUNCATED", "1") == "1"
 SKIP_IF_MISSING_PLATE = os.getenv("SKIP_IF_MISSING_PLATE", "1") == "1"
 SKIP_IF_MISSING_HEAD = os.getenv("SKIP_IF_MISSING_HEAD", "1") == "1"
 TRUNCATE_AREA_RATIO = float(os.getenv("TRUNCATE_AREA_RATIO", 0.85))
 
-# association thresholds
 HELMET_IN_MOTOR_RATIO = float(os.getenv("HELMET_IN_MOTOR_RATIO", 0.30))
 PLATE_IN_MOTOR_RATIO = float(os.getenv("PLATE_IN_MOTOR_RATIO", 0.35))
 NEAREST_DIAG_FACTOR = float(os.getenv("NEAREST_DIAG_FACTOR", 2.5))
 CENTER_INSIDE_ACCEPT = os.getenv("CENTER_INSIDE_ACCEPT", "1") == "1"
 
-# ----------------- HELPERS (must be defined before analyze) -----------------
+# ----------------- HELPERS -----------------
 def clamp_box(box, w, h):
     x1, y1, x2, y2 = box
     x1_cl = max(0, min(int(round(x1)), w-1))
@@ -93,13 +90,26 @@ def is_truncated_box(box, img_w, img_h, area_ratio_threshold=TRUNCATE_AREA_RATIO
     return ratio < area_ratio_threshold
 
 def normalize_plate(txt):
-    if not txt: return ""
+    if not txt:
+        return ""
     s = str(txt).upper()
     s = s.replace('O', '0').replace('Q', '0').replace('I', '1').replace('L', '1')
-    s = ''.join([c for c in s if c.isalnum()])
-    return s
+    s = re.sub(r'[^A-Z0-9]', '', s)
+    m = re.match(r'^(\d{2})([A-Z]{1,2})(\d)(\d{2,5})$', s)
+    if m:
+        prov, letters, digit, nums = m.groups()
+    else:
+        m2 = re.search(r'(\d{2})\D*([A-Z]{1,2})\D*(\d)(\d{2,5})', s)
+        if m2:
+            prov, letters, digit, nums = m2.groups()
+        else:
+            return s
+    group = letters + digit
+    if len(nums) == 5:
+        return f"{prov}-{group} {nums[:-2]}.{nums[-2:]}"
+    else:
+        return f"{prov}-{group} {nums}"
 
-# OCR help (same as your preprocess)
 def preprocess_plate_smooth_binary(pil_img):
     w, h = pil_img.size
     scale = max(640 / w, 1.0)
@@ -135,30 +145,24 @@ def ocr_plate_yolo_your_model(pil_crop):
     y_mean = np.mean(ys)
     line1 = [c for c in chars if c['y'] < y_mean]
     line2 = [c for c in chars if c['y'] >= y_mean]
-    line1_sorted = sorted(line1, key=lambda c: c['x'])
-    line2_sorted = sorted(line2, key=lambda c: c['x'])
-    text = ''.join([c['char'] for c in line1_sorted]) + ''.join([c['char'] for c in line2_sorted])
+    text = ''.join([c['char'] for c in sorted(line1, key=lambda c: c['x'])]) + \
+           ''.join([c['char'] for c in sorted(line2, key=lambda c: c['x'])])
     return normalize_plate(text)
 
-# association helpers
 def has_associated_plate(motor_box, plate_boxes, img_diag):
     if not plate_boxes: return None
-    best_candidate = None
-    best_score = -1.0
+    best_candidate, best_score = None, -1.0
     for pb in plate_boxes:
         inter = intersection_area(motor_box, pb)
         pa = box_area(pb)
         ratio_plate_in_motor = inter / (pa + 1e-9)
         if ratio_plate_in_motor >= PLATE_IN_MOTOR_RATIO:
             return pb
-        center_pb = center_point(pb)
-        if CENTER_INSIDE_ACCEPT and box_contains_point(motor_box, center_pb):
+        if CENTER_INSIDE_ACCEPT and box_contains_point(motor_box, center_point(pb)):
             return pb
-        iou_val = iou(motor_box, pb)
-        score = iou_val * 2.0 + ratio_plate_in_motor
+        score = iou(motor_box, pb) * 2.0 + ratio_plate_in_motor
         if score > best_score:
-            best_score = score
-            best_candidate = pb
+            best_score, best_candidate = score, pb
     if best_candidate is not None:
         if iou(motor_box, best_candidate) >= 0.05:
             return best_candidate
@@ -171,8 +175,7 @@ def has_associated_plate(motor_box, plate_boxes, img_diag):
 
 def has_associated_head(motor_box, viol_boxes, img_diag):
     if not viol_boxes: return None
-    best_candidate = None
-    best_score = -1.0
+    best_candidate, best_score = None, -1.0
     for vb in viol_boxes:
         inter = intersection_area(motor_box, vb)
         va = box_area(vb)
@@ -181,11 +184,9 @@ def has_associated_head(motor_box, viol_boxes, img_diag):
             return vb
         if CENTER_INSIDE_ACCEPT and box_contains_point(motor_box, center_point(vb)):
             return vb
-        iou_val = iou(motor_box, vb)
-        score = iou_val + ratio * 2.0
+        score = iou(motor_box, vb) + ratio * 2.0
         if score > best_score:
-            best_score = score
-            best_candidate = vb
+            best_score, best_candidate = score, vb
     if best_candidate is not None:
         if iou(motor_box, best_candidate) >= 0.05:
             return best_candidate
@@ -196,7 +197,7 @@ def has_associated_head(motor_box, viol_boxes, img_diag):
             return best_candidate
     return None
 
-# ----------------- LOAD MODELS (after helpers) -----------------
+# ----------------- LOAD MODELS -----------------
 print("Loading detect model:", DETECT_MODEL_PATH)
 detect_model = YOLO(DETECT_MODEL_PATH)
 print("Loading plate-char model:", PLATE_MODEL_PATH)
@@ -205,12 +206,8 @@ print("Models loaded.")
 
 # ----------------- FASTAPI APP -----------------
 app = FastAPI(title="Helmet / Motorcyclist Violation API")
-
 cors_env = os.getenv("CORS_ORIGINS", "*")
-if cors_env.strip() == "" or cors_env.strip() == "*":
-    origins = ["*"]
-else:
-    origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+origins = ["*"] if cors_env.strip() in ("", "*") else [o.strip() for o in cors_env.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,15 +219,13 @@ app.add_middleware(
 
 def read_image_from_bytes(data: bytes) -> Image.Image:
     try:
-        pil = Image.open(io.BytesIO(data)).convert("RGB")
-        return pil
+        return Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
         arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise RuntimeError("Cannot decode image bytes")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(img)
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
@@ -245,8 +240,7 @@ def extract_frame_from_video_bytes(data: bytes) -> Image.Image:
         vid.release()
         if not ret or frame is None:
             raise RuntimeError("Cannot read frame from video")
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(frame)
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 @app.get("/")
 def root():
@@ -257,21 +251,15 @@ async def analyze(file: UploadFile = File(...)):
     try:
         content = await file.read()
         kind = (file.content_type or "").lower()
-        if kind.startswith("video"):
-            pil_img = extract_frame_from_video_bytes(content)
-        else:
-            pil_img = read_image_from_bytes(content)
+        pil_img = extract_frame_from_video_bytes(content) if kind.startswith("video") else read_image_from_bytes(content)
     except Exception as e:
-        tb = traceback.format_exc()
-        print("Read file error:", e, tb)
+        print("Read file error:", e, traceback.format_exc())
         return JSONResponse(status_code=400, content={"error": f"Cannot read file: {str(e)}"})
 
-    # detection (use explicit device)
     try:
         results = detect_model.predict(source=pil_img, conf=DETECT_CONF, device=YOLO_DEVICE, verbose=False)
     except Exception as e:
-        tb = traceback.format_exc()
-        print("Detection error:", e, tb)
+        print("Detection error:", e, traceback.format_exc())
         return JSONResponse(status_code=500, content={"error": f"Detection failed: {str(e)}"})
 
     w_img, h_img = pil_img.size
@@ -279,9 +267,7 @@ async def analyze(file: UploadFile = File(...)):
     violations = []
 
     for res in results:
-        motor_front_boxes, motor_back_boxes = [], []
-        helmet_boxes, plate_boxes, violation_boxes = [], [], []
-
+        motor_front_boxes, motor_back_boxes, helmet_boxes, plate_boxes, violation_boxes = [], [], [], [], []
         for b in res.boxes:
             cls_name = detect_model.names[int(b.cls)]
             box = b.xyxy[0].cpu().numpy().astype(int).tolist()
@@ -296,29 +282,17 @@ async def analyze(file: UploadFile = File(...)):
             elif cls_name in ('no_helmet_front','no_helmet_back','wrong_helmet_front','wrong_helmet_back'):
                 violation_boxes.append(box)
 
-        # process front motors
-        for motor in motor_front_boxes:
-            if SKIP_IF_TRUNCATED and is_truncated_box(motor, w_img, h_img, TRUNCATE_AREA_RATIO):
-                print("Skipping motor (truncated by area):", motor)
-                continue
-
+        for motor in motor_front_boxes + motor_back_boxes:
+            if SKIP_IF_TRUNCATED and is_truncated_box(motor, w_img, h_img):
+                print("Skipping motor (truncated):", motor); continue
             best_plate = has_associated_plate(motor, plate_boxes, diag_img)
             best_head = has_associated_head(motor, violation_boxes, diag_img)
-
             if SKIP_IF_MISSING_PLATE and best_plate is None:
-                print("Skipping motor (no associated plate):", motor)
-                continue
+                print("Skipping motor (no plate):", motor); continue
             if SKIP_IF_MISSING_HEAD and best_head is None:
-                print("Skipping motor (no associated head/violation):", motor)
-                continue
-
+                print("Skipping motor (no head):", motor); continue
             motor_clamped = clamp_box(motor, w_img, h_img)
-            try:
-                mot_crop = pil_img.crop((motor_clamped[0], motor_clamped[1], motor_clamped[2], motor_clamped[3]))
-            except Exception as e:
-                print("Crop motor failed", e)
-                continue
-
+            mot_crop = pil_img.crop((motor_clamped[0], motor_clamped[1], motor_clamped[2], motor_clamped[3]))
             plate_text = ""
             if best_plate is not None:
                 pb = clamp_box(best_plate, w_img, h_img)
@@ -327,79 +301,21 @@ async def analyze(file: UploadFile = File(...)):
                     plate_text = ocr_plate_yolo_your_model(plate_crop)
                 except Exception as e:
                     print("Plate OCR failed:", e)
-                    plate_text = ""
-
             cropped_url = ""
             try:
                 buf = io.BytesIO()
-                mot_crop.save(buf, format='JPEG')
-                buf.seek(0)
+                mot_crop.save(buf, format='JPEG'); buf.seek(0)
                 if CLOUD_NAME and API_KEY and API_SECRET:
                     upl = cloudinary.uploader.upload(buf, folder='violations')
                     cropped_url = upl.get('secure_url','')
             except Exception as e:
                 print("Cloudinary upload error:", e)
-
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             violations.append({
                 "time": ts,
-                "license_plate": plate_text,
+                "license_plate": normalize_plate(plate_text),
                 "cropped_image_url": cropped_url,
-                "violation_type": "no_helmet_front" if best_head is not None else "motorcyclist_front",
+                "violation_type": "no_helmet_back" if motor in motor_back_boxes else "no_helmet_front",
                 "motor_box": motor_clamped
             })
-
-        # process back motors (same)
-        for motor in motor_back_boxes:
-            if SKIP_IF_TRUNCATED and is_truncated_box(motor, w_img, h_img, TRUNCATE_AREA_RATIO):
-                print("Skipping motor (truncated by area):", motor)
-                continue
-
-            best_plate = has_associated_plate(motor, plate_boxes, diag_img)
-            best_head = has_associated_head(motor, violation_boxes, diag_img)
-
-            if SKIP_IF_MISSING_PLATE and best_plate is None:
-                print("Skipping motor (no associated plate):", motor)
-                continue
-            if SKIP_IF_MISSING_HEAD and best_head is None:
-                print("Skipping motor (no associated head/violation):", motor)
-                continue
-
-            motor_clamped = clamp_box(motor, w_img, h_img)
-            try:
-                mot_crop = pil_img.crop((motor_clamped[0], motor_clamped[1], motor_clamped[2], motor_clamped[3]))
-            except Exception as e:
-                print("Crop motor failed", e)
-                continue
-
-            plate_text = ""
-            if best_plate is not None:
-                pb = clamp_box(best_plate, w_img, h_img)
-                try:
-                    plate_crop = pil_img.crop((pb[0], pb[1], pb[2], pb[3]))
-                    plate_text = ocr_plate_yolo_your_model(plate_crop)
-                except Exception as e:
-                    print("Plate OCR failed:", e)
-                    plate_text = ""
-
-            cropped_url = ""
-            try:
-                buf = io.BytesIO()
-                mot_crop.save(buf, format='JPEG')
-                buf.seek(0)
-                if CLOUD_NAME and API_KEY and API_SECRET:
-                    upl = cloudinary.uploader.upload(buf, folder='violations')
-                    cropped_url = upl.get('secure_url','')
-            except Exception as e:
-                print("Cloudinary upload error:", e)
-
-            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            violations.append({
-                "time": ts,
-                "license_plate": plate_text,
-                "cropped_image_url": cropped_url,
-                "violation_type": "no_helmet_back" if best_head is not None else "motorcyclist_back",
-                "motor_box": motor_clamped
-            })
-
     return JSONResponse(content=violations)
