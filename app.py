@@ -1,4 +1,3 @@
-# app.py (fixed, full)
 import re
 import os
 import io
@@ -46,6 +45,9 @@ HELMET_IN_MOTOR_RATIO = float(os.getenv("HELMET_IN_MOTOR_RATIO", 0.30))
 PLATE_IN_MOTOR_RATIO = float(os.getenv("PLATE_IN_MOTOR_RATIO", 0.35))
 NEAREST_DIAG_FACTOR = float(os.getenv("NEAREST_DIAG_FACTOR", 2.5))
 CENTER_INSIDE_ACCEPT = os.getenv("CENTER_INSIDE_ACCEPT", "1") == "1"
+
+# NEW: strict child-in-parent ratio for definitive parent-child association (user requested 80%)
+STRICT_CHILD_IN_PARENT_RATIO = float(os.getenv("STRICT_CHILD_IN_PARENT_RATIO", 0.80))
 
 # ----------------- HELPERS (must be defined before analyze) -----------------
 def clamp_box(box, w, h):
@@ -173,8 +175,28 @@ def ocr_plate_yolo_your_model(pil_crop):
     text = ''.join([c['char'] for c in line1_sorted]) + ''.join([c['char'] for c in line2_sorted])
     return normalize_plate(text)
 
-# association helpers
-def has_associated_plate(motor_box, plate_boxes, img_diag):
+# NEW association helper: strict child-in-parent by area ratio (>= STRICT_CHILD_IN_PARENT_RATIO)
+def find_child_by_strict_area(motor_box, child_boxes, area_ratio_threshold=STRICT_CHILD_IN_PARENT_RATIO):
+    """
+    child_boxes: list of dicts {'box': [x1,y1,x2,y2], 'conf': float, 'cls': str}
+    Return the best child dict whose (intersection_area / child_area) >= threshold.
+    If multiple candidates satisfy, choose one with highest conf.
+    """
+    best = None
+    for c in child_boxes:
+        pb = c['box']
+        pa = box_area(pb)
+        if pa <= 0:
+            continue
+        inter = intersection_area(motor_box, pb)
+        ratio = inter / (pa + 1e-9)
+        if ratio >= area_ratio_threshold:
+            if best is None or c.get('conf', 0.0) > best.get('conf', 0.0):
+                best = c
+    return best
+
+# keep these older, more flexible functions in case needed elsewhere, but we will use strict one by default
+def has_associated_plate_old(motor_box, plate_boxes, img_diag):
     if not plate_boxes: return None
     best_candidate = None
     best_score = -1.0
@@ -202,7 +224,7 @@ def has_associated_plate(motor_box, plate_boxes, img_diag):
             return best_candidate
     return None
 
-def has_associated_head(motor_box, viol_boxes, img_diag):
+def has_associated_head_old(motor_box, viol_boxes, img_diag):
     if not viol_boxes: return None
     best_candidate = None
     best_score = -1.0
@@ -312,39 +334,63 @@ async def analyze(file: UploadFile = File(...)):
     violations = []
 
     for res in results:
+        # store children as dicts (with confidence + cls) to enable strict selection
         motor_front_boxes, motor_back_boxes = [], []
         helmet_boxes, plate_boxes, violation_boxes = [], [], []
 
         for b in res.boxes:
-            cls_name = detect_model.names[int(b.cls)]
-            box = b.xyxy[0].cpu().numpy().astype(int).tolist()
+            # get class name & box coords & confidence
+            try:
+                cls_idx = int(b.cls)
+                cls_name = detect_model.names[cls_idx]
+            except Exception:
+                # fallback if something odd
+                cls_name = str(int(b.cls)) if hasattr(b, 'cls') else 'unknown'
+            try:
+                box = b.xyxy[0].cpu().numpy().astype(int).tolist()
+            except Exception:
+                # best-effort fallback
+                x1, y1, x2, y2 = list(map(int, (b.x1, b.y1, b.x2, b.y2))) if all(hasattr(b, a) for a in ('x1','y1','x2','y2')) else [0,0,0,0]
+                box = [x1, y1, x2, y2]
+            # try to extract confidence robustly
+            try:
+                conf = float(b.conf[0])
+            except Exception:
+                try:
+                    conf = float(b.conf)
+                except Exception:
+                    conf = 0.0
+
+            entry = {'box': box, 'conf': conf, 'cls': cls_name}
+
             if cls_name == 'motorcyclist_front':
-                motor_front_boxes.append(box)
+                motor_front_boxes.append(entry)
             elif cls_name == 'motorcyclist_back':
-                motor_back_boxes.append(box)
+                motor_back_boxes.append(entry)
             elif cls_name == 'helmet':
-                helmet_boxes.append(box)
+                helmet_boxes.append(entry)
             elif cls_name == 'license_plate':
-                plate_boxes.append(box)
+                plate_boxes.append(entry)
             elif cls_name in ('no_helmet_front','no_helmet_back','wrong_helmet_front','wrong_helmet_back'):
-                violation_boxes.append(box)
+                violation_boxes.append(entry)
 
         # process front motors
-        for motor in motor_front_boxes:
+        for motor_entry in motor_front_boxes:
+            motor = motor_entry['box']
             if SKIP_IF_TRUNCATED and is_truncated_box(motor, w_img, h_img, TRUNCATE_AREA_RATIO):
                 print("Skipping motor (truncated by area):", motor)
                 continue
 
-            best_plate = has_associated_plate(motor, plate_boxes, diag_img)
-            best_head = has_associated_head(motor, violation_boxes, diag_img)
+            # NEW strict association by area ratio >= STRICT_CHILD_IN_PARENT_RATIO
+            best_plate_entry = find_child_by_strict_area(motor, plate_boxes, STRICT_CHILD_IN_PARENT_RATIO)
+            best_head_entry = find_child_by_strict_area(motor, violation_boxes, STRICT_CHILD_IN_PARENT_RATIO)
 
-            if SKIP_IF_MISSING_PLATE and best_plate is None:
-                print("Skipping motor (no associated plate):", motor)
-                continue
-            if SKIP_IF_MISSING_HEAD and best_head is None:
-                print("Skipping motor (no associated head/violation):", motor)
+            # If either plate or head missing (as per your requirement), treat motor as occluded -> skip
+            if best_plate_entry is None or best_head_entry is None:
+                print("Skipping motor (missing strict-associated plate or head):", motor, "plate:", bool(best_plate_entry), "head:", bool(best_head_entry))
                 continue
 
+            # clamp & crop motor
             motor_clamped = clamp_box(motor, w_img, h_img)
             try:
                 mot_crop = pil_img.crop((motor_clamped[0], motor_clamped[1], motor_clamped[2], motor_clamped[3]))
@@ -352,9 +398,10 @@ async def analyze(file: UploadFile = File(...)):
                 print("Crop motor failed", e)
                 continue
 
+            # OCR plate from the strict-associated plate box
             plate_text = ""
-            if best_plate is not None:
-                pb = clamp_box(best_plate, w_img, h_img)
+            if best_plate_entry is not None:
+                pb = clamp_box(best_plate_entry['box'], w_img, h_img)
                 try:
                     plate_crop = pil_img.crop((pb[0], pb[1], pb[2], pb[3]))
                     plate_text = ocr_plate_yolo_your_model(plate_crop)
@@ -362,6 +409,7 @@ async def analyze(file: UploadFile = File(...)):
                     print("Plate OCR failed:", e)
                     plate_text = ""
 
+            # upload cropped motor
             cropped_url = ""
             try:
                 buf = io.BytesIO()
@@ -378,24 +426,22 @@ async def analyze(file: UploadFile = File(...)):
                 "time": ts,
                 "license_plate": plate_text,
                 "cropped_image_url": cropped_url,
-                "violation_type": "no_helmet_front" if best_head is not None else "motorcyclist_front",
+                "violation_type": best_head_entry['cls'] if best_head_entry is not None else "motorcyclist_front",
                 "motor_box": motor_clamped
             })
 
-        # process back motors (same)
-        for motor in motor_back_boxes:
+        # process back motors (same strict logic)
+        for motor_entry in motor_back_boxes:
+            motor = motor_entry['box']
             if SKIP_IF_TRUNCATED and is_truncated_box(motor, w_img, h_img, TRUNCATE_AREA_RATIO):
                 print("Skipping motor (truncated by area):", motor)
                 continue
 
-            best_plate = has_associated_plate(motor, plate_boxes, diag_img)
-            best_head = has_associated_head(motor, violation_boxes, diag_img)
+            best_plate_entry = find_child_by_strict_area(motor, plate_boxes, STRICT_CHILD_IN_PARENT_RATIO)
+            best_head_entry = find_child_by_strict_area(motor, violation_boxes, STRICT_CHILD_IN_PARENT_RATIO)
 
-            if SKIP_IF_MISSING_PLATE and best_plate is None:
-                print("Skipping motor (no associated plate):", motor)
-                continue
-            if SKIP_IF_MISSING_HEAD and best_head is None:
-                print("Skipping motor (no associated head/violation):", motor)
+            if best_plate_entry is None or best_head_entry is None:
+                print("Skipping motor (missing strict-associated plate or head):", motor, "plate:", bool(best_plate_entry), "head:", bool(best_head_entry))
                 continue
 
             motor_clamped = clamp_box(motor, w_img, h_img)
@@ -406,8 +452,8 @@ async def analyze(file: UploadFile = File(...)):
                 continue
 
             plate_text = ""
-            if best_plate is not None:
-                pb = clamp_box(best_plate, w_img, h_img)
+            if best_plate_entry is not None:
+                pb = clamp_box(best_plate_entry['box'], w_img, h_img)
                 try:
                     plate_crop = pil_img.crop((pb[0], pb[1], pb[2], pb[3]))
                     plate_text = ocr_plate_yolo_your_model(plate_crop)
@@ -431,7 +477,7 @@ async def analyze(file: UploadFile = File(...)):
                 "time": ts,
                 "license_plate": plate_text,
                 "cropped_image_url": cropped_url,
-                "violation_type": "no_helmet_back" if best_head is not None else "motorcyclist_back",
+                "violation_type": best_head_entry['cls'] if best_head_entry is not None else "motorcyclist_back",
                 "motor_box": motor_clamped
             })
 
